@@ -1,0 +1,366 @@
+---
+title: "Data preprocessing"
+author: "Irene García- Espantaleón"
+date: "2025-06-19"
+output: html_document
+---
+
+This .Rmd contains the preprocessing of the dataset that will be annotated for the
+analysis. I drew a sample of around 15,000 texts from the original 41,000, and 
+aggregated the target variable. At the end of the document, I export the processed
+dataset that will be annotated by the LLMs.
+
+## Setup and libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(readr)
+library(here)
+library(purrr)
+```
+
+## Preprocessing
+
+Load dataset, available at [this
+repo](https://github.com/bvidgen/Dynamically-Generated-Hate-Speech-Dataset/tree/main).
+
+```{r}
+data <- read.csv(here("data", "hatespeech_dataset.csv"))
+# 41,144 rows
+
+glimpse(data)
+```
+
+Basic info on the data from the repo:
+
+-   'acl.id' is the unique ID of the entry.
+
+-   'Text' is the content which has been entered. All content is
+    synthetic.
+
+-   'Label' is a binary variable, indicating whether or not the content
+    has been identified as hateful. It takes two values: hate, nothate.
+
+-   'Type' is a categorical variable, providing a secondary label for
+    hateful content. For hate it can take five values: Animosity,
+    Derogation, Dehumanization, Threatening and Support for Hateful
+    Entities. Please see the paper for more detail. For nothate the
+    'type' is 'none'. In round 1 the 'type' was not given and is marked
+    as 'notgiven'.
+
+-   'Target' is a categorical variable, providing the group that is
+    attacked by the hate. It can include intersectional characteristics
+    and multiple groups can be identified. For nothate the type is
+    'none'. Note that in round 1 the 'target' was not given and is
+    marked as 'notgiven'.
+
+-   'Level' reports whether the entry is original content or a
+    perturbation.
+
+-   'Round' is a categorical variable. It gives the round of data entry
+    (1, 2, 3 or 4) with a letter for whether the entry is original
+    content ('a') or a perturbation ('b'). Perturbations were not made
+    for round 1.
+
+-   'Round.base' is a categorical variable. It gives the round of data
+    entry, indicated with just a number (1, 2, 3 or 4).
+
+-   'Split' is a categorical variable. it gives the data split that the
+    entry has been assigned to. This can take the values 'train', 'dev'
+    and 'test'. The choice of splits is explained in the paper.
+
+-   'Annotator' is a categorical variable. It gives the annotator who
+    entered the content. Annotator IDs are random alphanumeric strings.
+    There are 20 annotators in the dataset.
+
+-   'acl.id.matched' is the ID of the matched entry, connecting the
+    original (given in 'acl.id') and the perturbed version.
+
+Shorthand labels for the target identities:
+
+-   none -\> for non hateful entries NoTargetRecorded -\> for hateful
+    entries with no target recorded
+
+-   mixed.race -\> Mixed race background
+
+-   ethnic.minority -\> Ethnic Minorities
+
+-   indig -\> Indigenous people
+
+-   indig.wom -\> Indigenous Women
+
+-   non.white -\> Non-whites (attacked as 'non-whites', rather than
+    specific non-white groups which are generally addressed separately)
+
+-   trav -\> Travellers (including Roma, gypsies)
+
+-   bla -\> Black people
+
+-   bla.wom -\> Black women
+
+-   bla.man -\> Black men
+
+-   african -\> African (all 'African' attacks will also be an attack
+    against Black people)
+
+-   jew -\> Jewish people
+
+-   mus -\> Muslims
+
+-   muswom -\> Muslim women
+
+-   wom -\> Women
+
+-   trans -\> Trans people
+
+-   gendermin -\> Gender minorities
+
+-   bis -\> Bisexual
+
+-   gay -\> Gay people (both men and women)
+
+-   gay.man -\> Gay men
+
+-   gay.wom -\> Lesbians
+
+-   dis -\> People with disabilities
+
+-   working -\> Working class people
+
+-   old.people -\> Elderly people
+
+-   asi -\> Asians
+
+-   asi.man -\> Asian men
+
+-   asi.wom -\> Asian women
+
+-   asi.east -\> East Asians
+
+-   asi.south -\> South Asians (e.g. Indians)
+
+-   asi.chin -\> Chinese people
+
+-   asi.pak -\> Pakistanis
+
+-   arab -\> Arabs, including people from the Middle East
+
+-   immig -\> Immigrants
+
+-   asylum -\> Asylum seekers
+
+-   ref -\> Refguees
+
+-   for -\> Foreigners
+
+-   eastern.europe -\> Eastern Europeans
+
+-   russian -\> Russian people
+
+-   pol -\> Polish people
+
+-   hispanic -\> Hispanic people, including latinx and Mexicans
+
+-   nazi -\> Nazis ('Support' type of hate)
+
+-   hitler -\> Hitler ('Support' type of hate)
+
+Selecting the columns I will need:
+
+```{r}
+data <- data %>% 
+  select(X, text, label, type, target, level, round.base) %>% # keeping meaningful cols
+  filter(round.base != 1) %>% # first round has no data on hate target
+  select(-round.base) |> 
+  filter(level == "original") |> # keeping only original texts
+  select(-level) |> 
+  filter(type != "support") |> # support has 207 observations
+  filter(target != "old.people") # around 20 observations and it's difficult to aggregate
+# 14,954 rows
+```
+
+Our sample to annotate has 15,000 rows.
+
+Aggregate hate targets:
+
+```{r}
+data$target <- str_replace_all(data$target, fixed("notargetrecorded"), "unknown")
+
+# category assignment rules:
+assign_categories <- function(labels) {
+  # Trim whitespace
+  labels <- str_trim(labels)
+
+  # Categories initialization
+  gender_labels <- c("wom", "wom", "wom") # "wom" and anything ending with ".wom"
+  ethnicity_labels <- c(
+    "mixed.race", "ethnic.minority", "indig", "indig.wom", "non.white",
+    "bla", "bla.wom", "bla.man", "african", "asi", "asi.wom", "asi.man", "arab", "hispanic", "trav"
+  )
+  nationality_labels <- c("asi.east", "asi.south", "asi.chin", "asi.pak", "eastern.europe", "russian", "pol", "other.national")
+  migrant_labels <- c("immig", "asylum", "ref", "for")
+  lgbt_labels <- c("trans", "gendermin", "bis", "gay", "gay.man", "gay.wom", "lgbtq")
+  religion_labels <- c("jew", "mus", "mus.wom")
+  disability_labels <- c("dis")
+  class_labels <- c("wc")
+
+  categories_found <- list(
+    gender = FALSE,
+    ethnicity = FALSE,
+    nationality = FALSE,
+    migrant = FALSE,
+    lgbt = FALSE,
+    religion = FALSE,
+    disability = FALSE,
+    class = FALSE
+  )
+  
+  unmapped <- character()
+
+  for (lab in labels) {
+    lab <- str_trim(lab)
+    # Check gender: "wom" or ends with ".wom"
+    if (lab == "wom" || str_ends(lab, ".wom")) {
+      categories_found$gender <- TRUE
+    }
+    # Ethnicity exact matches
+    if (lab %in% ethnicity_labels) {
+      categories_found$ethnicity <- TRUE
+    }
+    # Nationality exact matches
+    if (lab %in% nationality_labels) {
+      categories_found$nationality <- TRUE
+    }
+    # Migrant exact matches
+    if (lab %in% migrant_labels) {
+      categories_found$migrant <- TRUE
+    }
+    # LGBT exact matches
+    if (lab %in% lgbt_labels) {
+      categories_found$lgbt <- TRUE
+    }
+    # Religion exact matches
+    if (lab %in% religion_labels) {
+      categories_found$religion <- TRUE
+    }
+    # Disability exact matches
+    if (lab %in% disability_labels) {
+      categories_found$disability <- TRUE
+    }
+    # Class exact matches
+    if (lab %in% class_labels) {
+      categories_found$class <- TRUE
+    }
+    # If label didn't match any category, add to unmapped
+    if (!(
+      lab == "wom" || str_ends(lab, ".wom") ||
+      lab %in% ethnicity_labels ||
+      lab %in% nationality_labels ||
+      lab %in% migrant_labels ||
+      lab %in% lgbt_labels ||
+      lab %in% religion_labels ||
+      lab %in% disability_labels ||
+      lab %in% class_labels
+    )) {
+      unmapped <- c(unmapped, lab)
+    }
+  }
+  
+  return(list(categories = categories_found, unmapped = unmapped))
+}
+
+# Main function to process dataframe
+process_targets <- function(df) {
+  # Split labels, map to categories, create binary columns
+  df2 <- df %>%
+    mutate(
+      target_list = str_split(target, ",\\s*")
+    ) %>%
+    rowwise() %>%
+    mutate(
+      cat_map = list(assign_categories(target_list))
+    ) %>%
+    mutate(
+      gender = cat_map$categories$gender,
+      ethnicity = cat_map$categories$ethnicity,
+      nationality = cat_map$categories$nationality,
+      migrant = cat_map$categories$migrant,
+      lgbt = cat_map$categories$lgbt,
+      religion = cat_map$categories$religion,
+      disability = cat_map$categories$disability,
+      class = cat_map$categories$class,
+      unmapped = list(cat_map$unmapped)
+    ) %>%
+    ungroup()
+
+  # Extract all unmapped labels for review
+  unmapped_all <- unique(unlist(df2$unmapped))
+
+  list(processed_data = df2 %>% select(-cat_map, -target_list, -unmapped),
+       unmapped_labels = unmapped_all)
+}
+
+# Use and test the function
+result <- process_targets(data)
+result$unmapped_labels
+
+data <- result$processed_data
+```
+
+Aggregate nationality and migrant into "foreign":
+
+```{r}
+# create a column for none
+data <- data |> 
+  mutate(none = str_detect(target, fixed("none")))
+
+# drop unknown target rows (35)
+data <- data |> 
+  filter(target != "unknown")
+
+# aggregate nationality and migrant (all nationalities listed are foreign with
+# respect to the authors of the texts
+
+data <- data %>%
+  mutate(foreign = nationality | migrant) |>
+  select(-nationality, -migrant)
+```
+
+Create variable for target_counts:
+
+```{r}
+target_counts <- data %>%
+  summarise(
+    none = sum(none, na.rm = TRUE),
+    gender = sum(gender, na.rm = TRUE),
+    ethnicity = sum(ethnicity, na.rm = TRUE),
+    foreign = sum(foreign, na.rm = TRUE),
+    # nationality = sum(nationality, na.rm = TRUE),
+    # migrant = sum(migrant, na.rm = TRUE),
+    lgbt = sum(lgbt, na.rm = TRUE),
+    religion = sum(religion, na.rm = TRUE),
+    disability = sum(disability, na.rm = TRUE),
+    class = sum(class, na.rm = TRUE)
+  )
+
+print(target_counts)
+```
+
+Convert type to factor and reorder levels:
+
+```{r}
+data$type <- fct_relevel(as.factor(data$type), "none", "animosity", "dehumanization", "derogation", "threatening")
+```
+
+Export to .csv format:
+
+```{r}
+write.csv(data, here("data", "data.csv"), row.names = FALSE) # already included in the repo
+```

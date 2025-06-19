@@ -1,0 +1,781 @@
+---
+title: "Modeling"
+author: "Irene García-Espantaleón"
+date: "2025-06-19"
+output: html_document
+---
+
+In this document, I model patterns of disagreement in hate speech annotations.
+I first fit an ordinal logistic regression to predict the level of disagreement 
+between annotators. Then, I use binary logistic regression to predict whether 
+any disagreement occurs, and to model LLM-human mismatches. For each model, I
+apply variable selection, check confusion matrices, and plot odds ratios and CI
+graphs.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(MASS)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(forcats)
+library(tibble)
+library(irr)
+library(corrplot)
+library(caret)
+library(pscl)
+library(broom)
+library(grid)
+library(here)
+```
+
+```{r}
+sysfonts::font_add_google("Cardo", family = "cardo")
+showtext::showtext_auto()
+```
+
+## Load previous data
+
+```{r}
+anno_wide <- read.csv(here("data", "anno_wide.csv"))
+```
+
+Also created an ordinal variable with the three most common categories
+of agreement:
+
+```{r}
+anno_wide <- anno_wide %>%
+  mutate(
+    disagreement_level = case_when(
+      entropy == 0 ~ 0,
+      entropy >= 0.9 ~ 2,
+      entropy >= 0.70 ~ 1,
+      TRUE ~ NA_real_
+    ) %>%
+      factor(levels = 0:2, labels = c("agreement", "mild", "severe"), ordered = TRUE)
+  )
+```
+
+A binary variable for the presence of overall disagreement:
+
+```{r}
+anno_wide <- anno_wide %>%
+  mutate(any_disagreement = factor(
+    ifelse(disagreement_level == "agreement", 0, 1),
+    levels = c(0, 1),
+    labels = c("agreement", "disagreement")
+  ))
+```
+
+## Visualizations
+
+### Disagreement level proportions
+
+```{r}
+# Calculate agreement proportions for reordering
+ordering <- anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  count(type, disagreement_level) %>%
+  group_by(type) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(disagreement_level == "agreement") %>%
+  select(type, agreement_prop = prop)
+
+# Merge and plot
+anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  count(type, disagreement_level) %>%
+  group_by(type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  left_join(ordering, by = "type") %>%
+  mutate(type = fct_reorder(type, agreement_prop)) %>%
+  ggplot(aes(x = type, y = prop, fill = disagreement_level)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Disagreement level",
+    title = "Model disagreement levels by hate speech type (proportions)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Texts expressing animosity lead to higher disagreement between models,
+while texts containing threats show the greater consensus.
+
+```{r}
+anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  count(type, disagreement_level) %>%
+  ungroup() %>%
+  left_join(ordering, by = "type") %>%
+  mutate(type = fct_reorder(type, agreement_prop)) %>%
+  ggplot(aes(x = type, y = n, fill = disagreement_level)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Disagreement level",
+    title = "Model disagreement levels by hate speech type (counts)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+There are fewer examples of dehumanizing and threatening texts.
+
+```{r}
+anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  ggplot(aes(x = as.factor(n_targets), fill = disagreement_level)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Proportion of disagreement levels by number of target groups",
+    x = "",
+    y = "",
+    fill = "Disagreement Level"
+  ) +
+  scale_fill_manual(
+    values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Full agreement between the 5 model rises for higher number of groups
+targeted by the text.
+
+```{r}
+anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  ggplot(aes(x = as.factor(n_targets), fill = disagreement_level)) +
+  geom_bar(position = "dodge") +
+  labs(
+    title = "Count of disagreement levels by number of target groups",
+    x = "",
+    y = "",
+    fill = "Disagreement Level"
+  ) +
+  scale_fill_manual(
+    values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+There are extremely few examples of texts targeting more than 1 group.
+
+```{r}
+anno_wide %>%
+  filter(!is.na(disagreement_level)) %>%
+  ggplot(aes(x = label, fill = disagreement_level)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Proportion of disagreement levels by human label",
+    x = "",
+    y = "",
+    fill = "Disagreement level"
+  ) +
+  scale_fill_manual(
+    values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Disagreement among the 5 models doesn't seem to differ between texts
+labeled as hate and nothate by human annotators.
+
+```{r}
+anno_wide %>% 
+  filter(!is.na(disagreement_level)) %>% 
+  ggplot(aes(x = label, fill = disagreement_level)) + 
+  geom_bar(position = "dodge") + 
+  labs(
+    title = "Count of disagreement levels by human label", 
+    x = "", 
+    y = "", 
+    fill = "Disagreement level"
+  ) + 
+  scale_fill_manual(
+    values = c("agreement" = "#4CAF50", "mild" = "#FFC107", "severe" = "#F44336")
+  ) + 
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+```
+
+### Target/type mosaic plot
+
+```{r}
+# Step 1: Reshape anno_wide from wide to long format
+anno_long <- anno_wide %>%
+  pivot_longer(
+    cols = c(gender, ethnicity, foreign, lgbt, religion, disability, class),
+    names_to = "target_group",
+    values_to = "is_target"
+  ) %>%
+  filter(is_target == 1)  # Keep only rows where that target is present
+
+library(ggmosaic)
+
+mosaic <- ggplot(data = anno_long) +
+  geom_mosaic(aes(x = product(type, target_group), fill = type), color = NA) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_minimal(base_family = "cardo") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 30),
+    axis.text.y = element_text(size = 30),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  ) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Hate Type",
+    title = ""
+  )
+
+ggsave(
+  filename = here("plots", "mosaic_plot.png"),  
+  plot = mosaic,                    
+  width = 6,                              
+  height = 4,                            
+  dpi = 300                              
+)
+
+```
+
+### LLM-human disagreement
+
+Draw the subset of the data for which all 5 models agree, and check the consensus/
+mismatch with human labels:
+
+```{r}
+disagreements <- anno_wide %>%
+  filter(
+    (label == "hate" & agreement_type == "All not hate") |
+      (label == "nothate" & agreement_type == "All hate")
+  ) %>%
+  mutate(
+    mismatch_type = case_when(
+      label == "hate" & agreement_type == "All not hate" ~ "models missed hate",
+      label == "nothate" & agreement_type == "All hate" ~ "models overflagged hate"
+    )
+  )
+
+disagreements %>%
+  count(label, agreement_type)
+```
+
+When models "agree to disagree" with human annotators, they're more
+likely to label as "hate" a text that humans considered "nothate" than
+the other way around.
+
+```{r}
+disagreements %>%
+  count(type, agreement_type) |> 
+  arrange(n)
+
+disagreements_by_type <- disagreements %>%
+  group_by(type, mismatch_type) %>%
+  summarise(n = n(), .groups = "drop")
+
+ggplot(disagreements_by_type, aes(x = reorder(type, n), y = n, fill = mismatch_type)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Model–Human disagreements by hate type (full agreement cases)",
+    x = "Type of hate (human-annotated)",
+    y = "Number of disagreements",
+    fill = "Disagreement type"
+  ) +
+  scale_fill_manual(
+    values = c("models missed hate" = "#E15759", "models overflagged hate" = "#4E79A7")
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Texts expressing animosity are more vulnerable to disagreement between
+the 5 models and the human annotators, followed by derogation.
+
+## Test correlations
+
+```{r}
+# Select only numeric/logical variables
+numeric_vars <- anno_wide %>%
+  dplyr::select(where(is.numeric), where(is.logical)) |> 
+  select(-X)
+
+# dropping perfectly correlated
+numeric_vars <- numeric_vars %>%
+  dplyr::select(-n_na, -n_not_hate, -none, -n_labels, -n_chars)
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "lower", 
+         tl.cex = 0.8, number.cex = 0.7,
+         addCoef.col = "black", tl.col = "black")
+```
+
+## Models
+
+### Ordinal outcome: disagreement level
+
+Using the previously created variable.
+
+Create custom feature set:
+
+```{r}
+target_vars <- c("disagreement_level")
+
+explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count") # left n_targets out here
+
+model_data <- anno_wide %>%
+  select(all_of(target_vars), all_of(explanatory_vars))
+
+table(model_data$disagreement_level) #imbalance
+
+# scale numeric features
+model_data <- model_data %>%
+  mutate(across(c(n_words, subordinate_clause_count), scale))
+
+model_data$n_words <- as.numeric(model_data$n_words)
+model_data$subordinate_clause_count <- as.numeric(model_data$subordinate_clause_count)
+# model_data$n_targets <- as.numeric(model_data$n_targets)
+
+model_data <- model_data %>%
+  mutate(across(where(is.logical), as.integer))
+```
+
+Train model:
+
+```{r}
+set.seed(123)
+full_model <- polr(disagreement_level ~ ., data = model_data, Hess = TRUE)
+summary(full_model)
+```
+
+Test proportional odds assumption and multicollinearity:
+
+```{r}
+set.seed(123)
+# ASSUMPTIONS 
+library(brant)
+brant_test <- brant(full_model)
+print(brant_test)
+# assumption holds
+
+lm_approximation <- lm(as.numeric(disagreement_level) ~ type + gender + ethnicity + lgbt + 
+                       religion + disability + class + foreign + n_words + rep_letters + 
+                       leetspeak + subordinate_clause_count, data = model_data)
+
+# TEST FOR MULTICOLLINEARITY
+library(car)
+vif_values <- vif(lm_approximation)
+print(vif_values)
+#collinearity is not a problem
+```
+
+Use stepAIC to train a more parsimonious model:
+
+```{r}
+set.seed(123)
+step_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+summary(step_model)
+pR2(step_model)
+
+null_model <- polr(disagreement_level ~ 1, data = model_data, Hess = TRUE)
+anova(null_model, step_model)
+anova(full_model, step_model)
+```
+
+The models improve over the null, but show low explanatory power.
+The stepAIC model is preferred, because the extra complexity does not yield a 
+statistically significant gain in model fit.
+
+Plot confusion matrix:
+
+```{r}
+set.seed(123)
+pred_ord <- predict(step_model, type = "class")
+
+# Confusion matrix
+table(Predicted = pred_ord, Actual = model_data$disagreement_level)
+```
+
+Extract and plot odd-ratios:
+
+```{r}
+ord_df <- tidy(step_model, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% # remove intercept 
+  filter(!grepl("\\|", term)) %>% # remove thresholds agreement|mild and mild|severe
+  rename(
+    variable = term,
+    OR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high
+  )
+
+ord_df <- ord_df %>%
+  mutate(group = case_when(
+    grepl("^type", variable) ~ "Type",
+    variable %in% c("religion", "ethnicity", "disability", "lgbt", "gender") ~ "Target",
+    variable %in% c("n_words", "leetspeak", "rep_letters") ~ "Format",
+    TRUE ~ "Other"
+  ))
+
+ord_df <- ord_df %>%
+  mutate(variable_name = dplyr::recode(variable,
+    "typederogation" = "Derogation",
+    "typedehumanization" = "Dehumanization",
+    "typethreatening" = "Threatening",
+    "typenone" = "None",
+    "religion" = "Religion",
+    "ethnicity" = "Ethnicity",
+    "disability" = "Disability",
+    "lgbt" = "LGBT",
+    "gender" = "Gender",
+    "n_words" = "Text length",
+    "leetspeak" = "Leetspeak",
+    "rep_letters" = "Repeated letters"
+  ))
+
+
+ordinal_fp <- ggplot(ord_df, aes(x = OR, y = reorder(variable_name, OR))) +
+                  geom_point(size = 3) +
+                  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+                  geom_vline(xintercept = 1, linetype = "dashed") +
+                  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+                  scale_x_log10() +
+                  labs(
+                    x = "Odds Ratio (95% CI)",
+                    y = NULL,
+                    title = ""
+                  ) +
+                  theme_minimal(base_family = "cardo") +
+                  theme(
+                    panel.grid.minor = element_blank(),
+                    strip.text.y = element_text(angle = 0, face = "bold"),
+                    strip.placement = "outside",
+                    strip.text = element_text(size = 39),
+                    axis.title.x = element_text(size = 38),
+                    axis.text.x = element_text(size = 38),
+                    axis.text.y = element_text(size = 39),
+                    plot.margin = unit(c(1, 1, 1, 1), "cm"),  
+                    panel.spacing.y = unit(1.5, "lines")      
+                  )
+
+ggsave(
+  filename = here("plots", "ordinal_forest_plot.png"),
+  plot = ordinal_fp,                     
+  width = 6,                             
+  height = 7,                            
+  dpi = 300                              
+)
+```
+
+### Binary outcome: any disagreement
+
+Also using the previously created variable.
+
+Create feature set:
+
+```{r}
+target_vars <- c("any_disagreement")
+
+explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count")
+
+model_data <- anno_wide %>%
+  select(all_of(target_vars), all_of(explanatory_vars))
+
+table(model_data$any_disagreement)
+
+model_data <- model_data %>%
+  mutate(across(c(n_words, subordinate_clause_count), scale))
+
+model_data$n_words <- as.numeric(model_data$n_words)
+model_data$subordinate_clause_count <- as.numeric(model_data$subordinate_clause_count)
+# model_data$n_targets <- as.numeric(model_data$n_targets)
+
+model_data <- model_data %>%
+  mutate(across(where(is.logical), as.integer))
+```
+
+Train models:
+
+```{r}
+set.seed(123)
+full_bin <- glm(any_disagreement ~ ., data = model_data, family = binomial)
+summary(full_bin)
+
+step_bin <- stepAIC(full_bin, direction = "both", trace = FALSE)
+summary(step_bin)
+
+anova(full_bin, step_bin)
+pR2(step_bin)
+
+exp(coef(step_bin))
+```
+
+Again we observe statistically significant improvement over the null model but
+limited predictive power.
+
+```{r}
+set.seed(123)
+# Predicted probabilities and labels
+pred_probs <- predict(step_bin, type = "response")
+pred_labels <- ifelse(pred_probs > 0.5, 1, 0)  # adjust threshold if needed
+
+# Confusion matrix
+table(Predicted = pred_labels, Actual = model_data$any_disagreement)
+```
+
+Odd-ratios and CI table:
+
+```{r}
+any_df <- tidy(step_bin, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% # remove intercept 
+  filter(!grepl("\\|", term)) %>% # remove thresholds agreement|mild and mild|severe
+  rename(
+    variable = term,
+    OR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high
+  )
+
+any_df <- any_df %>%
+  mutate(group = case_when(
+      grepl("^type", variable) ~ "Type",
+      variable %in% c("religion", "ethnicity", "disability", "lgbt", "gender", "foreign", "class") ~ "Target",
+      variable %in% c("n_words", "leetspeak", "rep_letters", "subordinate_clause_count") ~ "Format",
+      TRUE ~ "Other"
+    ),
+        variable_name = dplyr::recode(variable,
+            "typeanimosity" = "Animosity",
+            "typederogation" = "Derogation",
+            "typedehumanization" = "Dehumanization",
+            "typethreatening" = "Threatening",
+            "religion" = "Religion",
+            "ethnicity" = "Ethnicity",
+            "disability" = "Disability",
+            "lgbt" = "LGBT",
+            "gender" = "Gender",
+            "n_words" = "Text length",
+            "leetspeak" = "Leetspeak",
+            "rep_letters" = "Repeated letters",
+            "subordinate_clause_count" = "Subordinate count"
+  ))
+
+anydis_fp <- ggplot(any_df, aes(x = OR, y = reorder(variable_name, OR))) +
+                  geom_point(size = 3) +
+                  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+                  geom_vline(xintercept = 1, linetype = "dashed") +
+                  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+                  scale_x_log10() +
+                  labs(
+                    x = "Odds Ratio (95% CI)",
+                    y = NULL,
+                    title = ""
+                  ) +
+                  theme_minimal(base_family = "cardo") +
+                  theme(
+                    panel.grid.minor = element_blank(),
+                    strip.text.y = element_text(angle = 0, face = "bold"),
+                    strip.placement = "outside",
+                    strip.text = element_text(size = 39),
+                    axis.title.x = element_text(size = 38),
+                    axis.text.x = element_text(size = 38),
+                    axis.text.y = element_text(size = 39),
+                    plot.margin = unit(c(1, 1, 1, 1), "cm"), 
+                    panel.spacing.y = unit(1.5, "lines")    
+                  )
+
+
+ggsave(
+  filename = here("plots", "anydis_forest_plot.png"), 
+  plot = anydis_fp,                  
+  width = 6,               
+  height = 7,                          
+  dpi = 300                         
+)
+```
+
+### LLM-human misalignment
+
+Draw consensus subset:
+
+```{r}
+consensus <- anno_wide |> 
+  filter(agreement_type != "Mixed") |> 
+    mutate(
+    llm_consensus = case_when(
+      agreement_type == "All hate" ~ "hate",
+      agreement_type == "All not hate" ~ "nothate",
+      TRUE ~ NA_character_  # In case there are any unexpected values
+    )
+    )
+
+table(consensus$agreement_type, consensus$llm_consensus)
+
+consensus <- consensus %>%
+  mutate(
+    llm_human_mismatch = case_when(
+      consensus$llm_consensus != label ~ "mismatch",
+      TRUE ~ "agreement"
+    ),
+    llm_human_mismatch = factor(llm_human_mismatch, levels = c("agreement", "mismatch"))
+  )
+
+print(table(LLM = consensus$llm_consensus, Human = consensus$label))
+
+prop.table(table(consensus$llm_human_mismatch))
+```
+
+Compute Krippendorff's alpha for LLM-human agreement:
+
+```{r}
+ratings <- consensus %>%
+  select(llm_consensus, label) %>%
+  rename(model = llm_consensus, human = label)
+
+# Step 2: Convert to matrix or data.frame
+ratings_matrix <- as.data.frame(ratings)
+
+# Step 3: Compute Krippendorff's alpha
+kripp.alpha(t(ratings_matrix), method = "nominal") 
+```
+
+Create feature set:
+
+```{r}
+target_vars <- c("llm_human_mismatch")
+
+explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count")
+
+model_data <- consensus %>%
+  select(all_of(target_vars), all_of(explanatory_vars))
+
+model_data <- model_data %>%
+  mutate(across(c(n_words, subordinate_clause_count), scale))
+
+model_data$n_words <- as.numeric(model_data$n_words)
+model_data$subordinate_clause_count <- as.numeric(model_data$subordinate_clause_count)
+# model_data$n_targets <- as.numeric(model_data$n_targets)
+
+model_data <- model_data %>%
+  mutate(across(where(is.logical), as.integer))
+```
+
+Train full and stepwise models:
+
+```{r}
+set.seed(123)
+mis_model <- glm(llm_human_mismatch ~ ., data = model_data, family = binomial)
+summary(mis_model)
+
+mis_stepmodel <- stepAIC(mis_model, direction = "both", trace = TRUE)
+summary(mis_stepmodel)
+
+anova(mis_model, mis_stepmodel)
+pR2(mis_stepmodel)
+
+exp(coef(mis_stepmodel))
+```
+
+Confusion matrix:
+
+```{r}
+set.seed(123)
+# Predict probabilities
+pred_probs <- predict(mis_stepmodel, type = "response")
+
+# Convert to predicted class using 0.5 threshold
+pred_class <- ifelse(pred_probs >= 0.5, 1, 0)
+# confusionMatrix(factor(pred_class), factor(model_data$llm_human_mismatch))
+
+table(Predicted = pred_class, Actual = model_data$llm_human_mismatch)
+```
+
+Odd-ratios and CI table:
+
+```{r}
+bin_df <- tidy(mis_stepmodel, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>% # remove intercept 
+  filter(!grepl("\\|", term)) %>% # remove thresholds agreement|mild and mild|severe
+  rename(
+    variable = term,
+    OR = estimate,
+    CI_lower = conf.low,
+    CI_upper = conf.high
+  )
+
+bin_df <- bin_df %>%
+  mutate(group = case_when(
+    grepl("^type", variable) ~ "Type",
+    variable %in% c("religion", "ethnicity", "disability", "lgbt", "gender", "foreign", "class") ~ "Target",
+    variable %in% c("n_words", "leetspeak", "rep_letters", "subordinate_clause_count") ~ "Format",
+    TRUE ~ "Other"
+  ),
+  variable_name = dplyr::recode(variable,
+    "typeanimosity" = "Animosity",
+    "typederogation" = "Derogation",
+    "typedehumanization" = "Dehumanization",
+    "typethreatening" = "Threatening",
+    "religion" = "Religion",
+    "ethnicity" = "Ethnicity",
+    "disability" = "Disability",
+    "lgbt" = "LGBT",
+    "gender" = "Gender",
+    "n_words" = "Text length",
+    "leetspeak" = "Leetspeak",
+    "rep_letters" = "Repeated letters",
+    "subordinate_clause_count" = "Subordinate count"
+  ))
+
+
+binary_fp <- ggplot(bin_df, aes(x = OR, y = reorder(variable_name, OR))) +
+                  geom_point(size = 3) +
+                  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+                  geom_vline(xintercept = 1, linetype = "dashed") +
+                  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+                  scale_x_log10() +
+                  labs(
+                    x = "Odds Ratio (95% CI)",
+                    y = NULL,
+                    title = ""
+                  ) +
+                  theme_minimal(base_family = "cardo") +
+                  theme(
+                    panel.grid.minor = element_blank(),
+                    strip.text.y = element_text(angle = 0, face = "bold"),
+                    strip.placement = "outside",
+                    strip.text = element_text(size = 39),
+                    axis.title.x = element_text(size = 38),
+                    axis.text.x = element_text(size = 38),
+                    axis.text.y = element_text(size = 39),
+                    plot.margin = unit(c(1, 1, 1, 1), "cm"),  
+                    panel.spacing.y = unit(1.5, "lines")      
+                  )
+
+ggsave(
+  filename = here("plots", "binary_forest_plot.png"),
+  plot = binary_fp,                     
+  width = 6,                             
+  height = 7,                            
+  dpi = 300                               
+)
+```
+
+```{r}
+
+```
+

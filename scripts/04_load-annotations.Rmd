@@ -1,0 +1,373 @@
+---
+title: "Loading annotations"
+author: "Irene García-Espantaleón"
+date: "2025-06-19"
+output: html_document
+---
+
+In this document I load the annotated predictions and ensure quality by filtering
+out incomplete annotations (e.g., missing labels). I then explore model agreement
+and disagreement patterns using entropy and Krippendorff’s alpha, and check the
+distribution of disagreement type by a few variables. The document also merges
+metadata from the original dataset and creates linguistic features. Finally, it 
+identifies and explores cases of strong model–human disagreement.
+
+## Setup and libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(irr)
+library(stringr)
+library(forcats)
+library(readr)
+library(ggmosaic)
+library(here)
+```
+
+## Load annotated data
+
+Load and process the dataset labeled by LLMs:
+
+```{r}
+annotations <- readRDS(here("data", "llm_annotations.rds"))
+
+# keep groups with exactly 5 rows
+annotations <- annotations %>%
+  group_by(X) %>%
+  filter(n() == 5) %>% 
+  ungroup()
+
+# convert prediction col to factor
+annotations <- annotations %>%
+  mutate(prediction = factor(prediction, levels = c("hate speech", "not hate speech")))
+
+table(annotations$prediction, useNA = "always")
+```
+We find relative balance between hate speech and not hate speech instances.
+
+```{r}
+annotations %>%
+  count(X, model) %>%
+  filter(n > 1)
+```
+
+There are no duplicated text-model pairs.
+
+Inspect NAs:
+
+```{r}
+# are texts with NAs systematically longer than texts without them?
+annotations %>%
+  group_by(X) %>%
+  # For each text, check if *any* prediction is NA
+  summarise(
+    text = first(text),
+    any_na = any(is.na(prediction)),
+    word_count = str_count(first(text), "\\S+"),
+    .groups = "drop"
+  ) %>%
+  group_by(is_na = any_na) %>%
+  summarise(
+    mean_words = mean(word_count),
+    n_texts = n(),
+    .groups = "drop"
+  )
+```
+
+LLMs might deliver missing labels due to excessive text length.
+
+Drop the texts for which at least one label is NA:
+
+```{r}
+missing_labels <- annotations |> 
+  filter(is.na(prediction))
+
+annotations <- annotations %>%
+  filter(!X %in% pull(missing_labels, X))
+```
+
+Label distribution per model:
+
+```{r}
+annotations %>%
+  group_by(model, prediction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = prediction, values_from = n, values_fill = 0) %>%
+  mutate(
+    total = `hate speech` + `not hate speech`,
+    hate_pct = `hate speech` / total * 100
+  ) |> 
+  arrange(desc(hate_pct))
+
+ggplot(annotations, aes(x = model, fill = prediction)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportion of each prediction per model",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+asure agreement
+
+Check the number of agreement and disagreement cases.
+
+```{r}
+model_disagree <- annotations %>%
+  group_by(X) %>%
+  summarise(
+    n_models = n(),
+    n_hate = sum(prediction == "hate speech", na.rm = TRUE),
+    n_not_hate = sum(prediction == "not hate speech", na.rm = TRUE),
+    n_na = sum(is.na(prediction)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    n_votes = n_models - n_na,
+    agreement = case_when(
+      n_hate == n_votes & n_votes > 0 ~ "All hate",
+      n_not_hate == n_votes & n_votes > 0 ~ "All not hate",
+      n_na == n_models ~ "All NA",
+      TRUE ~ "Mixed"
+    )
+  )
+
+table(model_disagree$agreement)
+```
+
+Compute Krippendorff's alpha for the whole dataset.
+
+```{r}
+wide <- annotations %>%
+  select(X, text, model, prediction) %>%
+  distinct() %>%  # just in case there are accidental duplicates
+  pivot_wider(
+    names_from = model,
+    values_from = prediction
+  )
+
+# convert to matrix
+ratings_matrix <- wide %>%
+  select(-X, -text) %>%         # drop identifiers
+  as.matrix() %>%
+  apply(2, as.character) %>%    # ensure all are characters
+  t() 
+
+kripp.alpha(ratings_matrix, method = "nominal")
+```
+
+Check entropy scores for each text.
+
+```{r}
+entropy <- function(x) {
+  x <- as.character(x)  # convert to character
+  probs <- prop.table(table(x))
+  -sum(probs * log2(probs))
+}
+
+
+entropy_scores <- annotations %>%
+  group_by(X) %>%
+  summarise(entropy = entropy(prediction), .groups = "drop")
+
+unique(entropy_scores$entropy)
+```
+
+There are 3 possible scores:
+
+-   0 for agreement
+
+-   0.72 for 1-4 disagreement
+
+-   0.97 for 3-2 disagreement
+
+```{r}
+entropy_scores %>%
+  count(round(entropy, 2))
+
+entropy_scores %>%
+  filter(!is.na(entropy)) %>%
+  mutate(entropy = round(entropy, 2)) %>%
+  count(entropy) %>%
+  ggplot(aes(x = factor(entropy), y = n)) +
+  geom_col(fill = "#69b3a2") +
+  labs(
+    title = "Frequency of entropy scores",
+    x = "Entropy (rounded)",
+    y = "Number of texts"
+  ) +
+  theme_minimal()
+```
+
+Compute pairwise agreement rates to see how models tend to agree/disagree with
+the majority vote.
+
+```{r}
+# Majority vote per text (excluding NAs)
+majority_vote <- annotations %>%
+  group_by(X) %>%
+  filter(!is.na(prediction)) %>%
+  summarise(
+    majority = names(which.max(table(prediction))),
+    .groups = "drop"
+  )
+
+# Compare each model's prediction to the majority vote
+model_agreement <- annotations %>%
+  left_join(majority_vote, by = "X") %>%
+  mutate(agrees_with_majority = prediction == majority) %>%
+  group_by(model) %>%
+  summarise(
+    n = sum(!is.na(prediction)),
+    agreement_rate = mean(agrees_with_majority, na.rm = TRUE)
+  )
+
+print(model_agreement)
+```
+
+The model microsoft/Phi-3-mini-4k-instruct is the most disagreeing with
+the majority vote (agrees 85% of the times), while Qwen/Qwen3-8B and 
+01-ai/Yi-1.5-9B-Chat are the most agreeing (agree more than 90% of the times).
+
+## Creation of new variables
+
+Merge annotations with metadata:
+
+```{r}
+data <- read.csv(here("data", "data.csv"))
+```
+
+I created new variables related to the text format: number of characters, number
+of words, presence of repeated letters and presence of leetspeak.
+
+```{r}
+data <- data |> 
+  mutate(
+    n_chars = nchar(text),
+    n_words = str_count(text, "\\S+"),
+    rep_letters = str_detect(text, "([a-zA-Z])\\1{2,}"),  # three or more
+    leetspeak = str_detect(text, "\\b(?=[\\w@$]*[A-Za-z])(?=[\\w@$]*\\d)[\\w@$]{4,}\\b") &
+      !str_detect(text, "#[^\\s]*\\d+[^\\s]*") &  # hashtags with digits (separate check)
+      !str_detect(
+        text,
+        regex(
+          paste0(
+            "\\b(?:",
+              "(19|20)\\d{2}s?",                # decades like 1990s or 2020s (removed extra \\b)
+              "|\\d{1,2}(st|nd|rd|th)\\b",       # ordinals like 21st, 3rd (suffix required, word boundary after)
+              "|\\d+(cm|mm|kg|lbs|mph|km|ghz|hz|°f|°c|miles?|mil|ft|feet|yards?)",  # units (fixed miles/mile)
+              "|\\d+(k|m|g|b)(?!\\w)",           # numeric suffixes with word boundary
+              "|\\d+(mil|millions?|bill(?:ions?)?|billion)",  # quantities (added billion)
+              "|covid[_\\d]*",                   # covid with digits or underscores
+              "|4chan|8chan",                    # platforms
+              "|\\d+(am|pm)",                    # times 10am, 5pm
+              "|\\b(usa|uk)\\b",                   # countries (removed 'us' as it's too common)
+              "|\\d+bc",                       # BC dates
+              "|\\d+s(?!\\w)",                 # plurals like 10s, 100s with word boundary
+              "|[£$€]\\d+\\w+"                # currency followed by digits and text
+            ,")\\b"
+          ),
+          ignore_case = TRUE
+        )
+      )
+  )
+
+```
+
+Check examples of texts with repeated letters and leetspeak:
+
+```{r}
+data |> filter(rep_letters == TRUE) |> 
+  slice_sample(n = 7) |> 
+  select(text, label)
+
+data |> filter(leetspeak == TRUE) |> 
+  slice_sample(n = 7) |> 
+  select(text, label)
+```
+
+Count cases:
+
+```{r}
+data %>%
+  summarise(
+    count_leetspeak = sum(leetspeak, na.rm = TRUE),
+    count_rep_letters = sum(rep_letters, na.rm = TRUE)
+  )
+```
+
+Merge the subordinate_counts table built using spaCy.
+
+```{r}
+subordinate_counts <- read.csv(here("data", "subordinate_counts.csv"))
+
+data <- data %>%
+  left_join(subordinate_counts, by = c("X" = "doc_id")) %>%
+  mutate(subordinate_clause_count = replace_na(subordinate_clause_count, 0))
+```
+
+Create a column for the number of groups targeted by each text:
+
+```{r}
+target_cols <- c(
+  "disability", "ethnicity", "gender", "lgbt", "religion",
+  "foreign", "class"
+)
+
+data <- data %>%
+  rowwise() %>%
+  mutate(
+    n_targets = sum(c_across(all_of(target_cols)), na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+table(data$n_targets)
+
+data %>%
+  mutate(target_combo = apply(.[, c("gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign")], 1, function(x) {
+    paste(names(x)[x], collapse = "+")
+  })) %>%
+  count(target_combo, sort = TRUE)
+```
+
+Merge metadata and annotations and create a few more variables about LLM
+labels:
+
+```{r}
+anno_wide <- annotations %>%
+  group_by(X) %>%
+  summarise(
+    n_models = sum(!is.na(prediction)),
+    n_hate = sum(prediction == "hate speech", na.rm = TRUE),
+    n_not_hate = sum(prediction == "not hate speech", na.rm = TRUE),
+    n_na = sum(is.na(prediction)),
+    n_labels = n_distinct(prediction[!is.na(prediction)]),
+    majority_label = names(sort(table(prediction), decreasing = TRUE))[1],
+    entropy = entropy(prediction),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    agreement_type = case_when(
+      n_hate == n_models & n_models > 0 ~ "All hate",
+      n_not_hate == n_models & n_models > 0 ~ "All not hate",
+      n_na == 5 ~ "All NA",
+      TRUE ~ "Mixed"
+    )) %>%
+  inner_join(data, by = "X") |>
+  dplyr::select(-majority_label)
+```
+
+Export the resulting dataset: 
+
+```{r}
+write.csv(anno_wide, here("data", "anno_wide.csv"), row.names = FALSE)
+```
+
+
+
