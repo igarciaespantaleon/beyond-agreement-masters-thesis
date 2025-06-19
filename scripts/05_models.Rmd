@@ -42,6 +42,9 @@ showtext::showtext_auto()
 
 ```{r}
 anno_wide <- read.csv(here("data", "anno_wide.csv"))
+
+# create type as factor again because it's imported as character
+anno_wide$type <- fct_relevel(as.factor(anno_wide$type), "none", "animosity", "dehumanization", "derogation", "threatening")
 ```
 
 Also created an ordinal variable with the three most common categories
@@ -312,12 +315,12 @@ the 5 models and the human annotators, followed by derogation.
 ```{r}
 # Select only numeric/logical variables
 numeric_vars <- anno_wide %>%
-  dplyr::select(where(is.numeric), where(is.logical)) |> 
-  select(-X)
+  dplyr::select(where(is.numeric), where(is.logical)) |>
+  dplyr::select(-X)
 
 # dropping perfectly correlated
 numeric_vars <- numeric_vars %>%
-  dplyr::select(-n_na, -n_not_hate, -none, -n_labels, -n_chars)
+  dplyr::select(-n_na, -n_not_hate, -none, -n_labels, -n_chars, -n_models)
 
 cor_matrix <- cor(numeric_vars, use = "complete.obs")
 
@@ -340,7 +343,7 @@ target_vars <- c("disagreement_level")
 explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count") # left n_targets out here
 
 model_data <- anno_wide %>%
-  select(all_of(target_vars), all_of(explanatory_vars))
+  dplyr::select(all_of(target_vars), all_of(explanatory_vars))
 
 table(model_data$disagreement_level) #imbalance
 
@@ -438,7 +441,7 @@ ord_df <- ord_df %>%
     "typederogation" = "Derogation",
     "typedehumanization" = "Dehumanization",
     "typethreatening" = "Threatening",
-    "typenone" = "None",
+    "typeanimosity" = "Animosity",
     "religion" = "Religion",
     "ethnicity" = "Ethnicity",
     "disability" = "Disability",
@@ -495,7 +498,7 @@ target_vars <- c("any_disagreement")
 explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count")
 
 model_data <- anno_wide %>%
-  select(all_of(target_vars), all_of(explanatory_vars))
+  dplyr::select(all_of(target_vars), all_of(explanatory_vars))
 
 table(model_data$any_disagreement)
 
@@ -644,7 +647,7 @@ Compute Krippendorff's alpha for LLM-human agreement:
 
 ```{r}
 ratings <- consensus %>%
-  select(llm_consensus, label) %>%
+  dplyr::select(llm_consensus, label) %>%
   rename(model = llm_consensus, human = label)
 
 # Step 2: Convert to matrix or data.frame
@@ -662,7 +665,7 @@ target_vars <- c("llm_human_mismatch")
 explanatory_vars <- c("type", "gender", "ethnicity", "lgbt", "religion", "disability", "class", "foreign", "n_words", "rep_letters", "leetspeak", "subordinate_clause_count")
 
 model_data <- consensus %>%
-  select(all_of(target_vars), all_of(explanatory_vars))
+  dplyr::select(all_of(target_vars), all_of(explanatory_vars))
 
 model_data <- model_data %>%
   mutate(across(c(n_words, subordinate_clause_count), scale))

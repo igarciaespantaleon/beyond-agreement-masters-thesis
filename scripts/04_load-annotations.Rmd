@@ -241,6 +241,9 @@ Merge annotations with metadata:
 
 ```{r}
 data <- read.csv(here("data", "data.csv"))
+
+# create type as factor again because it's imported as character
+data$type <- fct_relevel(as.factor(data$type), "none", "animosity", "dehumanization", "derogation", "threatening")
 ```
 
 I created new variables related to the text format: number of characters, number
