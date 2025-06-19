@@ -15,7 +15,7 @@ The repository is structured in folders:
  - **02_annotation-function.R**	queries LLMs and saves predictions
  - **03_spacy.R**	uses spaCy to extract syntactic features
  - **04_load-annotations.Rmd**	combines annotations and prepares analysis data
- - **05_models.Rmd**	builds and analyzes models of inter-LLM disagreement and LLM-human disagreement
+ - **05_models.Rmd**	builds and analyzes models of inter-LLM and LLM-human disagreement
 
 `data/` stores every dataset needed to run the scripts, including raw input, annotations, and processed outputs.
 
